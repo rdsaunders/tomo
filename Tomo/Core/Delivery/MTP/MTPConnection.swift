@@ -1,6 +1,7 @@
 import Foundation
 import IOKit
 import IOUSBHost
+import os
 import Synchronization
 
 /// Errors at the MTP boundary. Surfaced to the user through
@@ -37,7 +38,6 @@ nonisolated enum MTPError: LocalizedError {
 /// it, so detection never contends with an in-flight transfer.
 nonisolated struct MTPDeviceDescriptor: Sendable, Equatable {
     let serial: String
-    let productName: String
 }
 
 /// One MTP session over raw USB (`IOUSBHost`). Apple's ImageCaptureCore
@@ -55,13 +55,31 @@ nonisolated struct MTPDeviceDescriptor: Sendable, Equatable {
 nonisolated final class MTPConnection {
     static let amazonVendorID = 0x1949
 
-    private static let sessionLock = Mutex(())
+    /// Process-wide state carried between sessions, guarded by the lock that
+    /// serialises them.
+    private struct SessionState {
+        /// IORegistry entry ID of the USB interface whose last session ended
+        /// mid-transaction; recover before the next OpenSession on it so it
+        /// doesn't read a stale reply. A replugged Kindle gets a new entry
+        /// and starts clean, so it's skipped.
+        var needsRecovery: UInt64?
+    }
 
+    private static let sessionLock = Mutex(SessionState())
+
+    private let service: io_service_t
     private let interface: IOUSBHostInterface
     private let bulkIn: IOUSBHostPipe
     private let bulkOut: IOUSBHostPipe
     private let maxPacketSize: Int
     private var transactionID: UInt32 = 0
+    /// The transaction whose command went out but whose response hasn't come
+    /// back. Non-nil after a throw means the device and host disagree about
+    /// where the conversation is — no further commands until `recover()`.
+    private var inFlight: UInt32?
+    /// An I/O error said the device is gone (unplugged). Recovery is
+    /// pointless then — there's nothing to talk to.
+    private var sawDeviceGone = false
     /// Bytes read past the end of the previous container. Devices end each
     /// container with a short packet, so this is normally empty.
     private var pending = Data()
@@ -70,6 +88,9 @@ nonisolated final class MTPConnection {
     /// Generous: after a large SendObject the Kindle can take a while to
     /// flush before it sends the response.
     private static let responseTimeout: TimeInterval = 120
+    /// How long `recover()` waits for each stale read before deciding the
+    /// device has nothing more queued.
+    private static let drainTimeout: TimeInterval = 0.5
     private static let readChunk = 256 * 1024
     private static let writeChunk = 1024 * 1024
 
@@ -85,18 +106,21 @@ nonisolated final class MTPConnection {
                 product.localizedCaseInsensitiveContains("kindle"),
                 let serial = parentProperty(service, "kUSBSerialNumberString") as? String
             else { return false }
-            results.append(MTPDeviceDescriptor(serial: serial, productName: product))
+            results.append(MTPDeviceDescriptor(serial: serial))
             return false
         }
         return results
     }
 
     /// Opens a session on the Kindle with this USB serial, runs `body`, and
-    /// closes it again — on success and on throw.
+    /// closes it again — on success and on throw. If `body` fails mid-
+    /// transaction the session isn't closed (the device would read the
+    /// CloseSession as payload); it's recovered instead, now and again before
+    /// the next session.
     static func withSession<T>(
         serial: String, _ body: (MTPConnection) throws(MTPError) -> T
     ) throws(MTPError) -> T {
-        try sessionLock.withLock { _ throws(MTPError) in
+        try sessionLock.withLock { state throws(MTPError) in
             var found: io_service_t = 0
             forEachMTPInterface { service in
                 guard parentProperty(service, "kUSBSerialNumberString") as? String == serial
@@ -108,11 +132,30 @@ nonisolated final class MTPConnection {
             guard found != 0 else { throw .deviceNotFound }
             defer { IOObjectRelease(found) }
 
+            var entryID: UInt64 = 0
+            IORegistryEntryGetRegistryEntryID(found, &entryID)
+
             let connection = try MTPConnection(service: found)
             defer { connection.interface.destroy() }
-            try connection.openSession()
-            defer { _ = try? connection.transact(.closeSession) }
-            return try body(connection)
+            if state.needsRecovery == entryID { connection.recover() }
+            state.needsRecovery = nil
+
+            do throws(MTPError) {
+                try connection.openSession()
+                let result = try body(connection)
+                if !connection.endSession() { state.needsRecovery = entryID }
+                return result
+            } catch {
+                if !connection.endSession() { state.needsRecovery = entryID }
+                // Say "disconnected", not "USB transfer failed", when the
+                // cable was pulled.
+                if case .transport(let detail) = error, connection.isDeviceGone {
+                    deliveryLogger.notice(
+                        "mtp transfer cut off by disconnect: \(detail, privacy: .public)")
+                    throw .deviceNotFound
+                }
+                throw error
+            }
         }
     }
 
@@ -137,7 +180,7 @@ nonisolated final class MTPConnection {
                 try device.__configure(withValue: 0, matchInterfaces: false)
             } catch {
                 if (error as NSError).code == Int(Int32(bitPattern: 0xE000_02C5)) { throw .deviceBusy }
-                throw .transport(error.localizedDescription)
+                throw .transport(describe(error))
             }
         }
     }
@@ -177,13 +220,14 @@ nonisolated final class MTPConnection {
     // MARK: - Transport
 
     private init(service: io_service_t) throws(MTPError) {
+        self.service = service
         do {
             interface = try IOUSBHostInterface(
                 __ioService: service, options: [], queue: nil, interestHandler: nil)
         } catch {
             // kIOReturnExclusiveAccess: someone else has the interface open.
             if (error as NSError).code == Int(Int32(bitPattern: 0xE000_02C5)) { throw .deviceBusy }
-            throw .transport(error.localizedDescription)
+            throw .transport(Self.describe(error))
         }
 
         var inPipe: IOUSBHostPipe?
@@ -220,7 +264,7 @@ nonisolated final class MTPConnection {
             try bulkOut.__sendIORequest(
                 with: NSMutableData(data: data), bytesTransferred: &sent, completionTimeout: timeout)
         } catch {
-            throw .transport(error.localizedDescription)
+            throw ioFailure(error)
         }
     }
 
@@ -242,7 +286,7 @@ nonisolated final class MTPConnection {
                 try bulkIn.__sendIORequest(
                     with: chunk, bytesTransferred: &got, completionTimeout: timeout)
             } catch {
-                throw .transport(error.localizedDescription)
+                throw ioFailure(error)
             }
             // A zero-length packet terminating the previous transfer — skip.
             buffer.append(Data(bytes: chunk.bytes, count: got))
@@ -257,15 +301,185 @@ nonisolated final class MTPConnection {
         return transactionID
     }
 
+    /// Sends a command and marks its transaction in flight until the
+    /// matching response is read.
+    private func begin(_ op: PTP.Operation, _ params: [UInt32] = [], transactionID tid: UInt32)
+        throws(MTPError)
+    {
+        inFlight = tid
+        try write(PTP.command(op, transactionID: tid, params: params))
+    }
+
+    /// If the first attempt gets no sane reply — the device is still stuck
+    /// in a transaction from before, e.g. Tomo quit mid-send — recover and
+    /// try once more.
     private func openSession() throws(MTPError) {
-        // Session-less operations use transaction ID 0.
-        try write(PTP.command(.openSession, transactionID: 0, params: [1]))
-        let response = try readContainer(timeout: Self.commandTimeout)
-        let code = try PTP.parseHeader(response).code
-        // A previous session left open by an aborted transfer is fine to reuse.
-        guard code == PTP.Response.ok || code == PTP.Response.sessionAlreadyOpen else {
-            throw .response(operation: PTP.Operation.openSession.rawValue, code: code)
+        do throws(MTPError) {
+            try attemptOpenSession()
+        } catch {
+            guard inFlight != nil else { throw error }  // a clean refusal
+            recover()
+            try attemptOpenSession()
         }
+    }
+
+    private func attemptOpenSession() throws(MTPError) {
+        // Session-less operations use transaction ID 0.
+        try begin(.openSession, [1], transactionID: 0)
+        do throws(MTPError) {
+            try readResponse(.openSession, tid: 0)
+        } catch .response(_, let code) where code == PTP.Response.sessionAlreadyOpen {
+            // A previous session left open by an aborted transfer is fine to reuse.
+        }
+    }
+
+    /// Closes the session if the conversation is still in step; otherwise
+    /// recovers. Returns false when the device may still have stale data
+    /// queued, so the next session should recover again before opening.
+    private func endSession() -> Bool {
+        if inFlight == nil { _ = try? transact(.closeSession) }
+        guard inFlight != nil else { return true }
+        if isDeviceGone {
+            deliveryLogger.notice("mtp device disconnected mid-transaction; nothing to recover")
+            inFlight = nil
+            return true
+        }
+        recover()
+        return false
+    }
+
+    /// The Kindle has left the bus: an I/O error said so, or the interface
+    /// is no longer in the IORegistry.
+    private var isDeviceGone: Bool {
+        sawDeviceGone || IORegistryEntryInPlane(service, kIOServicePlane) == 0
+    }
+
+    /// IOReturn codes that mean the device is gone rather than misbehaving.
+    private static let deviceGoneCodes: Set<UInt32> = [
+        0xE000_02C0,  // kIOReturnNoDevice
+        0xE000_02D7,  // kIOReturnOffline
+        0xE000_02D9,  // kIOReturnNotAttached
+    ]
+
+    /// Error text with the raw IOReturn code, so logs can tell an unplug
+    /// from a timeout from a stall ("Unable to send IO." alone can't).
+    nonisolated static func describe(_ error: any Error) -> String {
+        let code = UInt32(truncatingIfNeeded: (error as NSError).code)
+        return "\(error.localizedDescription) [0x\(String(code, radix: 16))]"
+    }
+
+    /// Records whether a USB error means the device is gone, and wraps it.
+    private func ioFailure(_ error: any Error) -> MTPError {
+        let code = UInt32(truncatingIfNeeded: (error as NSError).code)
+        if Self.deviceGoneCodes.contains(code) { sawDeviceGone = true }
+        return .transport(Self.describe(error))
+    }
+
+    /// Best-effort resync after a transaction died part-way, following the
+    /// Still Image class recovery sequence: Cancel Request for a known
+    /// transaction (Device Reset Request when it's unknown — a fresh process,
+    /// a failed OpenSession), wait for the device to report OK, abort and
+    /// un-stall both bulk pipes, then discard whatever the device still has
+    /// queued for us (a late response, the rest of a data phase).
+    private func recover() {
+        defer { inFlight = nil }
+        let reachable =
+            if let tid = inFlight, tid != 0 {
+                classRequest(
+                    PTP.cancelRequest, "cancel",
+                    data: NSMutableData(data: PTP.cancelRequestData(transactionID: tid)))
+            } else {
+                classRequest(PTP.deviceResetRequest, "device reset")
+            }
+        guard reachable, !isDeviceGone else {
+            // Can't even take a control request: treat as unplugged, so the
+            // caller reports "disconnected" rather than "USB transfer failed".
+            sawDeviceGone = true
+            deliveryLogger.notice("mtp device unreachable; skipping recovery")
+            return
+        }
+        waitForDeviceReady()
+        for pipe in [bulkOut, bulkIn] {
+            try? pipe.__abort(with: .synchronous)
+            try? pipe.clearStall()
+        }
+        pending = Data()
+        var drained = 0
+        drain: for _ in 0..<64 {
+            let buffer = NSMutableData(length: Self.readChunk)!
+            var got = 0
+            do {
+                try bulkIn.__sendIORequest(
+                    with: buffer, bytesTransferred: &got, completionTimeout: Self.drainTimeout)
+            } catch {
+                if (error as NSError).code != Int(Int32(bitPattern: 0xE000_02D6)) {  // kIOReturnTimeout
+                    deliveryLogger.warning(
+                        "mtp drain failed: \(Self.describe(error), privacy: .public)")
+                }
+                break drain
+            }
+            drained += got
+        }
+        deliveryLogger.notice(
+            "mtp recovered from interrupted transaction; discarded \(drained) stale bytes")
+    }
+
+    /// Host→device class request on the MTP interface. Best-effort: logged,
+    /// never thrown. Returns whether the device is still there to talk to:
+    /// a STALL means it answered "not supported" (fine — carry on with the
+    /// rest of recovery); any other failure means it's unplugged or wedged
+    /// past what the bulk-pipe steps can fix.
+    @discardableResult
+    private func classRequest(_ request: UInt8, _ label: String, data: NSMutableData? = nil) -> Bool {
+        let setup = IOUSBDeviceRequest(
+            bmRequestType: 0x21,  // host→device, class, interface
+            bRequest: request, wValue: 0, wIndex: interfaceNumber,
+            wLength: UInt16(data?.length ?? 0))
+        var sent = 0
+        do {
+            try interface.__send(
+                setup, data: data, bytesTransferred: &sent, completionTimeout: Self.commandTimeout)
+            return true
+        } catch {
+            _ = ioFailure(error)
+            deliveryLogger.warning(
+                "mtp \(label, privacy: .public) request failed: \(Self.describe(error), privacy: .public)")
+            return (error as NSError).code == Int(Int32(bitPattern: 0xE000_5000))  // kUSBHostReturnPipeStalled
+        }
+    }
+
+    /// Polls Get Device Status until the device reports OK (it answers
+    /// Device Busy while it's still unwinding a cancel or reset). Bounded —
+    /// a device that doesn't implement it just gets logged.
+    private func waitForDeviceReady() {
+        var lastCode: UInt16?
+        for _ in 0..<20 {
+            let setup = IOUSBDeviceRequest(
+                bmRequestType: 0xA1,  // device→host, class, interface
+                bRequest: PTP.getDeviceStatusRequest, wValue: 0, wIndex: interfaceNumber,
+                wLength: 20)
+            let buffer = NSMutableData(length: 20)!
+            var got = 0
+            do {
+                try interface.__send(
+                    setup, data: buffer, bytesTransferred: &got, completionTimeout: Self.commandTimeout)
+            } catch {
+                deliveryLogger.warning(
+                    "mtp get device status failed: \(Self.describe(error), privacy: .public)")
+                return
+            }
+            var reader = PTPReader(Data(bytes: buffer.bytes, count: got))
+            _ = try? reader.u16()  // length
+            lastCode = try? reader.u16()
+            if lastCode == PTP.Response.ok { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        deliveryLogger.warning(
+            "mtp device not ready after recovery (status \(String(lastCode ?? 0, radix: 16), privacy: .public))")
+    }
+
+    private var interfaceNumber: UInt16 {
+        UInt16(interface.interfaceDescriptor.pointee.bInterfaceNumber)
     }
 
     /// One command → optional data-in → response round trip. Returns the
@@ -275,27 +489,34 @@ nonisolated final class MTPConnection {
         _ op: PTP.Operation, _ params: [UInt32] = [], send payload: Data? = nil
     ) throws(MTPError) -> (data: Data, params: [UInt32]) {
         let tid = nextTransactionID()
-        try write(PTP.command(op, transactionID: tid, params: params))
+        try begin(op, params, transactionID: tid)
         if let payload {
-            try sendDataPhase(op, tid: tid, length: payload.count) { offset, count in
-                payload.subdata(in: offset..<offset + count)
+            return try sendData(op, tid: tid, length: payload.count, timeout: Self.commandTimeout) {
+                offset, count in payload.subdata(in: offset..<offset + count)
             }
         }
-        return try readResponse(op)
+        return try readResponse(op, tid: tid)
     }
 
+    /// Reads containers up to the response for `tid`. A container from any
+    /// other transaction means host and device are out of step — throw and
+    /// leave the transaction in flight so the session gets recovered.
     @discardableResult
-    private func readResponse(_ op: PTP.Operation, timeout: TimeInterval = commandTimeout)
-        throws(MTPError) -> (data: Data, params: [UInt32])
-    {
+    private func readResponse(
+        _ op: PTP.Operation, tid: UInt32, timeout: TimeInterval = commandTimeout
+    ) throws(MTPError) -> (data: Data, params: [UInt32]) {
         var incoming = Data()
         while true {
             let container = try readContainer(timeout: timeout)
             let header = try PTP.parseHeader(container)
+            guard header.transactionID == tid else {
+                throw .malformed("reply for transaction \(header.transactionID), expected \(tid)")
+            }
             switch PTP.ContainerType(rawValue: header.type) {
             case .data:
                 incoming = container.dropFirst(PTP.headerSize)
             case .response:
+                inFlight = nil
                 guard header.code == PTP.Response.ok else {
                     throw .response(operation: op.rawValue, code: header.code)
                 }
@@ -307,16 +528,30 @@ nonisolated final class MTPConnection {
     }
 
     /// Streams a data container of `length` bytes, pulling the payload in
-    /// chunks from `chunk(offset, count)`.
-    private func sendDataPhase(
-        _ op: PTP.Operation, tid: UInt32, length: Int,
+    /// chunks from `chunk(offset, count)`, then reads the response.
+    ///
+    /// If `chunk` fails (a short read of the source file — the USB side is
+    /// fine), the rest of the declared length is sent as zeros so the
+    /// transaction completes in step, and the chunk error is rethrown after
+    /// the response. The caller deletes the junk object.
+    @discardableResult
+    private func sendData(
+        _ op: PTP.Operation, tid: UInt32, length: Int, timeout: TimeInterval,
         chunk: (_ offset: Int, _ count: Int) throws(MTPError) -> Data
-    ) throws(MTPError) {
+    ) throws(MTPError) -> (data: Data, params: [UInt32]) {
         var outgoing = PTP.dataHeader(op, transactionID: tid, payloadLength: length)
         var offset = 0
+        var chunkError: MTPError?
         repeat {
             let count = min(Self.writeChunk - outgoing.count, length - offset)
-            outgoing.append(try chunk(offset, count))
+            if chunkError == nil {
+                do throws(MTPError) {
+                    outgoing.append(try chunk(offset, count))
+                } catch {
+                    chunkError = error
+                }
+            }
+            if chunkError != nil { outgoing.append(Data(count: count)) }
             offset += count
             try write(outgoing, timeout: Self.responseTimeout)
             outgoing = Data()
@@ -329,9 +564,12 @@ nonisolated final class MTPConnection {
                 try bulkOut.__sendIORequest(
                     with: nil, bytesTransferred: &sent, completionTimeout: Self.commandTimeout)
             } catch {
-                throw .transport(error.localizedDescription)
+                throw ioFailure(error)
             }
         }
+        let response = try readResponse(op, tid: tid, timeout: timeout)
+        if let chunkError { throw chunkError }
+        return response
     }
 
     // MARK: - Operations
@@ -369,10 +607,6 @@ nonisolated final class MTPConnection {
             current = next.handle
         }
         return current
-    }
-
-    func getObject(_ handle: UInt32) throws(MTPError) -> Data {
-        try transact(.getObject, [handle]).data
     }
 
     func delete(_ handle: UInt32) throws(MTPError) {
@@ -415,6 +649,16 @@ nonisolated final class MTPConnection {
         }
     }
 
+    /// Replaces `name` in `parent`. MTP has no overwrite, so any existing
+    /// object of that name is deleted first.
+    ///
+    /// That means a re-send that fails part-way loses the old copy. Writing
+    /// to a temporary name and renaming it into place would avoid that, but
+    /// the Paperwhite 12th gen refuses SetObjectPropValue(ObjectFileName)
+    /// with 0x201C (Invalid DeviceProp Value), even for fresh names after a
+    /// restart, so every send would cost two transfers. A failed upload
+    /// does delete its own half-written object, so the Kindle never indexes
+    /// a truncated book.
     private func upload(
         name: String, size: Int, storage: UInt32, parent: UInt32,
         chunk: (_ offset: Int, _ count: Int) throws(MTPError) -> Data
@@ -422,15 +666,40 @@ nonisolated final class MTPConnection {
         if let existing = try child(named: name, storage: storage, parent: parent) {
             try delete(existing.handle)
         }
+        let handle = try sendObjectInfo(named: name, size: size, storage: storage, parent: parent)
+        try sendObjectData(handle, size: size, chunk: chunk)
+    }
+
+    /// SendObjectInfo: declares the object and returns its new handle.
+    private func sendObjectInfo(
+        named name: String, size: Int, storage: UInt32, parent: UInt32
+    ) throws(MTPError) -> UInt32 {
         let info = PTP.ObjectInfo(
             storageID: storage, format: PTP.ObjectFormat.undefined, size: UInt32(size),
             parent: parent, filename: name, modified: nil)
-        try transact(.sendObjectInfo, [storage, parent], send: PTP.encodeObjectInfo(info))
+        let params = try transact(.sendObjectInfo, [storage, parent], send: PTP.encodeObjectInfo(info))
+            .params
+        // Response params: storage, parent, new object handle.
+        guard params.count >= 3 else { throw .malformed("SendObjectInfo returned no handle") }
+        return params[2]
+    }
 
-        let tid = nextTransactionID()
-        try write(PTP.command(.sendObject, transactionID: tid))
-        try sendDataPhase(.sendObject, tid: tid, length: size, chunk: chunk)
-        try readResponse(.sendObject, timeout: Self.responseTimeout)
+    /// SendObject: streams the bytes for the object `SendObjectInfo` just
+    /// declared. On failure deletes the half-written object — unless the
+    /// session is out of step, in which case no command can be sent and the
+    /// leftover is replaced by the next send of the same book.
+    private func sendObjectData(
+        _ handle: UInt32, size: Int,
+        chunk: (_ offset: Int, _ count: Int) throws(MTPError) -> Data
+    ) throws(MTPError) {
+        do throws(MTPError) {
+            let tid = nextTransactionID()
+            try begin(.sendObject, transactionID: tid)
+            try sendData(.sendObject, tid: tid, length: size, timeout: Self.responseTimeout, chunk: chunk)
+        } catch {
+            if inFlight == nil { try? delete(handle) }
+            throw error
+        }
     }
 }
 

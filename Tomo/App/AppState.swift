@@ -867,13 +867,11 @@ final class AppState {
         do {
             try await device.eject()
             deliveryLogger.info("ejected device: \(device.displayName, privacy: .public)")
-            // The unmount notification clears `device` and `deviceFilenames`.
-            // MTP devices never unmount (their USB-removal event lands ~1.5 s
-            // later), so clear them now for an immediate UI response.
-            if device is KindleMTP {
-                self.device = nil
-                deviceFilenames = []
-            }
+            // Clear now for an immediate UI response. Volume devices would
+            // also be cleared by the unmount notification, but MTP devices
+            // never unmount (their USB-removal event lands ~1.5 s later).
+            self.device = nil
+            deviceFilenames = []
         } catch {
             deliveryLogger.error("eject failed: \(error.localizedDescription, privacy: .public)")
         }

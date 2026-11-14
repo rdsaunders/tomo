@@ -28,18 +28,26 @@ nonisolated struct KindleMTP: BookDevice {
         Set(files().map(\.name))
     }
 
+    /// Retries once: the first listing after USB attach can land before the
+    /// Kindle is ready for sessions, and an empty result would show every
+    /// book as "not on device" (inviting duplicate re-sends) until the next
+    /// refresh.
     func files() -> [DeviceFile] {
-        do {
-            return try MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
-                try listDocuments(conn)
+        for attempt in 1...2 {
+            do {
+                return try MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
+                    try listDocuments(conn)
+                }
+            } catch {
+                // The protocol has no error channel here; an unreadable device
+                // shows as empty, so make sure the reason is in the logs.
+                deliveryLogger.error(
+                    "kindle mtp listing failed (attempt \(attempt)): \(error.localizedDescription, privacy: .public)")
+                if case .deviceNotFound = error { break }
+                if attempt == 1 { Thread.sleep(forTimeInterval: 1) }
             }
-        } catch {
-            // The protocol has no error channel here; an unreadable device
-            // shows as empty, so make sure the reason is in the logs.
-            deliveryLogger.error(
-                "kindle mtp listing failed: \(error.localizedDescription, privacy: .public)")
-            return []
         }
+        return []
     }
 
     func isSystemFile(relativePath: String) -> Bool {

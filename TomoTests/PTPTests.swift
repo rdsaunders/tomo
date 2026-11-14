@@ -87,7 +87,17 @@ struct PTPTests {
         let utc = try #require(PTP.parseDate("20261114T143005.0Z"))
         #expect(utc.timeIntervalSince1970 == 1_794_666_605)
 
+        // The same instant, written with different offsets.
+        #expect(PTP.parseDate("20261114T153005+0100")?.timeIntervalSince1970 == 1_794_666_605)
+        #expect(PTP.parseDate("20261114T093005-0500")?.timeIntervalSince1970 == 1_794_666_605)
+        #expect(PTP.parseDate("20261114T200005.0+0530")?.timeIntervalSince1970 == 1_794_666_605)
+
         #expect(PTP.parseDate("") == nil)
         #expect(PTP.parseDate("garbage-date-str") == nil)
+    }
+
+    @Test func cancelRequestCarriesEventCodeAndTransaction() {
+        let bytes = [UInt8](PTP.cancelRequestData(transactionID: 0x0102_0304))
+        #expect(bytes == [0x01, 0x40, 0x04, 0x03, 0x02, 0x01])
     }
 }

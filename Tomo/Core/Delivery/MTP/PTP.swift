@@ -18,13 +18,11 @@ nonisolated enum PTP {
     }
 
     enum Operation: UInt16 {
-        case getDeviceInfo = 0x1001
         case openSession = 0x1002
         case closeSession = 0x1003
         case getStorageIDs = 0x1004
         case getObjectHandles = 0x1007
         case getObjectInfo = 0x1008
-        case getObject = 0x1009
         case deleteObject = 0x100B
         case sendObjectInfo = 0x100C
         case sendObject = 0x100D
@@ -33,6 +31,24 @@ nonisolated enum PTP {
     enum Response {
         static let ok: UInt16 = 0x2001
         static let sessionAlreadyOpen: UInt16 = 0x201E
+    }
+
+    /// Still Image class "Cancel Request" (bRequest 0x64): tells the device
+    /// to abandon `transactionID`. Its data phase is the cancellation event
+    /// code (0x4001) followed by the transaction ID.
+    static let cancelRequest: UInt8 = 0x64
+    /// Device Reset Request: abandon whatever transaction is in progress,
+    /// for when we don't know its ID. No data phase.
+    static let deviceResetRequest: UInt8 = 0x66
+    /// Get Device Status: device→host, `u16` length then a PTP response code
+    /// (OK once the device has finished unwinding a cancel or reset).
+    static let getDeviceStatusRequest: UInt8 = 0x67
+
+    static func cancelRequestData(transactionID: UInt32) -> Data {
+        var out = Data()
+        out.appendLE(UInt16(0x4001))
+        out.appendLE(transactionID)
+        return out
     }
 
     enum ObjectFormat {
@@ -168,10 +184,22 @@ nonisolated enum PTP {
         guard let y = num(0..<4), let mo = num(4..<6), let d = num(6..<8),
             let h = num(9..<11), let mi = num(11..<13), let sec = num(13..<15)
         else { return nil }
-        let utc = s.hasSuffix("Z")
         var comps = DateComponents(year: y, month: mo, day: d, hour: h, minute: mi, second: sec)
-        comps.timeZone = utc ? TimeZone(identifier: "UTC") : .current
+        comps.timeZone = zone(of: chars[15...])
         return Calendar(identifier: .gregorian).date(from: comps)
+    }
+
+    /// The zone suffix after the seconds (and any `.s` tenths): `Z` is UTC,
+    /// `±hhmm` is that offset, anything else is local time.
+    private static func zone(of suffix: ArraySlice<Character>) -> TimeZone {
+        if suffix.last == "Z" { return TimeZone(identifier: "UTC")! }
+        guard let sign = suffix.lastIndex(where: { $0 == "+" || $0 == "-" }),
+            suffix.endIndex - sign == 5,
+            let hh = Int(String(suffix[(sign + 1)..<(sign + 3)])),
+            let mm = Int(String(suffix[(sign + 3)..<(sign + 5)])),
+            let zone = TimeZone(secondsFromGMT: (suffix[sign] == "-" ? -1 : 1) * (hh * 3600 + mm * 60))
+        else { return .current }
+        return zone
     }
 }
 
