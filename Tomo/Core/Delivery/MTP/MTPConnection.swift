@@ -595,16 +595,26 @@ nonisolated final class MTPConnection {
         try children(storage: storage, parent: parent).first { $0.info.filename == name }
     }
 
-    /// Resolves a `/`-separated path of folder names from `parent`.
-    func folder(at path: String, storage: UInt32, from parent: UInt32 = PTP.rootParent)
-        throws(MTPError) -> UInt32
-    {
+    /// Resolves a `/`-separated path of folder names from `parent`,
+    /// creating missing folders when `create` is set.
+    func folder(
+        at path: String, storage: UInt32, from parent: UInt32 = PTP.rootParent,
+        create: Bool = false
+    ) throws(MTPError) -> UInt32 {
         var current = parent
         for name in path.split(separator: "/").map(String.init) {
-            guard let next = try child(named: name, storage: storage, parent: current),
-                next.info.isFolder
-            else { throw .notFound(path) }
-            current = next.handle
+            if let next = try child(named: name, storage: storage, parent: current) {
+                guard next.info.isFolder else { throw .notFound(path) }
+                current = next.handle
+            } else if create {
+                // A folder is an association object: SendObjectInfo alone
+                // creates it, with no SendObject data phase.
+                current = try sendObjectInfo(
+                    named: name, format: PTP.ObjectFormat.association, size: 0,
+                    storage: storage, parent: current)
+            } else {
+                throw .notFound(path)
+            }
         }
         return current
     }
@@ -672,10 +682,11 @@ nonisolated final class MTPConnection {
 
     /// SendObjectInfo: declares the object and returns its new handle.
     private func sendObjectInfo(
-        named name: String, size: Int, storage: UInt32, parent: UInt32
+        named name: String, format: UInt16 = PTP.ObjectFormat.undefined, size: Int,
+        storage: UInt32, parent: UInt32
     ) throws(MTPError) -> UInt32 {
         let info = PTP.ObjectInfo(
-            storageID: storage, format: PTP.ObjectFormat.undefined, size: UInt32(size),
+            storageID: storage, format: format, size: UInt32(size),
             parent: parent, filename: name, modified: nil)
         let params = try transact(.sendObjectInfo, [storage, parent], send: PTP.encodeObjectInfo(info))
             .params

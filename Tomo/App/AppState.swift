@@ -881,12 +881,12 @@ final class AppState {
         let center = NSWorkspace.shared.notificationCenter
         mountTask = Task { @MainActor [weak self] in
             for await _ in center.notifications(named: NSWorkspace.didMountNotification) {
-                await self?.refreshDeviceState()
+                await self?.refreshDeviceState(skipIfUnchanged: true)
             }
         }
         unmountTask = Task { @MainActor [weak self] in
             for await _ in center.notifications(named: NSWorkspace.didUnmountNotification) {
-                await self?.refreshDeviceState()
+                await self?.refreshDeviceState(skipIfUnchanged: true)
             }
         }
         // MTP Kindles never mount; USB attach/detach is their trigger. The
@@ -910,8 +910,15 @@ final class AppState {
     /// mount/unmount notification — not just e-readers — so keeping them
     /// off main is what prevents app-hang reports when any volume comes
     /// and goes.
-    private func refreshDeviceState() async {
+    ///
+    /// `skipIfUnchanged` is for volume notifications: when an unrelated
+    /// volume comes or goes (a DMG, Time Machine, a network share) the
+    /// connected device is still the same one, so its listing is left as
+    /// is rather than walked again — over MTP that's a USB round trip per
+    /// file, holding the session lock a send may be waiting on.
+    private func refreshDeviceState(skipIfUnchanged: Bool = false) async {
         let detected = await Task.detached { DeviceScanner.detect() }.value
+        if skipIfUnchanged, detected?.id == device?.id { return }
         device = detected
         if let detected {
             deviceFilenames = await Task.detached { detected.filenames() }.value

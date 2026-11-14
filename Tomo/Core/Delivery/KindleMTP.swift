@@ -171,8 +171,9 @@ nonisolated struct KindleMTP: BookDevice {
                 else { return }
                 try MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
                     let (storage, _) = try Self.documentsFolder(conn)
+                    // Created if missing, like the volume driver does.
                     let thumbnails = try conn.folder(
-                        at: KindleCoverThumbnail.thumbnailsSubpath, storage: storage)
+                        at: KindleCoverThumbnail.thumbnailsSubpath, storage: storage, create: true)
                     try conn.upload(bytes, as: filename, storage: storage, parent: thumbnails)
                 }
                 deliveryLogger.info(
