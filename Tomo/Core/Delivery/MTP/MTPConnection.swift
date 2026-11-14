@@ -662,13 +662,18 @@ nonisolated final class MTPConnection {
     /// Replaces `name` in `parent`. MTP has no overwrite, so any existing
     /// object of that name is deleted first.
     ///
-    /// That means a re-send that fails part-way loses the old copy. Writing
-    /// to a temporary name and renaming it into place would avoid that, but
-    /// the Paperwhite 12th gen refuses SetObjectPropValue(ObjectFileName)
-    /// with 0x201C (Invalid DeviceProp Value), even for fresh names after a
-    /// restart, so every send would cost two transfers. A failed upload
-    /// does delete its own half-written object, so the Kindle never indexes
-    /// a truncated book.
+    /// That means a re-send that fails part-way loses the old copy. Staging
+    /// the new copy and swapping it in afterwards would avoid that, but the
+    /// Paperwhite 12th gen refuses both ways of doing it, although its
+    /// DeviceInfo lists both operations:
+    /// - SetObjectPropValue(ObjectFileName), renaming a temporary object:
+    ///   0x201C (Invalid DeviceProp Value), even for fresh names after a
+    ///   restart
+    /// - MoveObject from a staging folder at the storage root (hidden or
+    ///   not) into `documents/`: 0x2002 (General Error)
+    /// With either, every send would cost two transfers. A failed upload
+    /// does delete its own half-written object when the session is still
+    /// in step, so the Kindle doesn't index a truncated book.
     private func upload(
         name: String, size: Int, storage: UInt32, parent: UInt32,
         chunk: (_ offset: Int, _ count: Int) throws(MTPError) -> Data
