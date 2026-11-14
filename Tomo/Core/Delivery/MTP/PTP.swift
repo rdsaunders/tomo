@@ -26,6 +26,7 @@ nonisolated enum PTP {
         case deleteObject = 0x100B
         case sendObjectInfo = 0x100C
         case sendObject = 0x100D
+        case getObjectPropList = 0x9805
     }
 
     enum Response {
@@ -163,6 +164,59 @@ nonisolated enum PTP {
             filename: filename, modified: modified)
     }
 
+    // MARK: - ObjectPropList
+
+    private enum ObjectProperty {
+        static let storageID: UInt16 = 0xDC01
+        static let format: UInt16 = 0xDC02
+        static let size: UInt16 = 0xDC04
+        static let filename: UInt16 = 0xDC07
+        static let modified: UInt16 = 0xDC09
+        static let parent: UInt16 = 0xDC0B
+    }
+
+    /// `GetObjectPropList` payload: a `u32` count of elements, each
+    /// `handle u32`, `property u16`, `datatype u16`, value. Collected into an
+    /// `ObjectInfo` per handle; objects without a filename and format are
+    /// left out (the caller asks for those individually).
+    static func decodeObjectPropList(_ data: Data) throws(MTPError) -> [UInt32: ObjectInfo] {
+        struct Partial {
+            var storageID: UInt32 = 0
+            var format: UInt16?
+            var size: UInt64 = 0
+            var parent: UInt32 = 0
+            var filename: String?
+            var modified: Date?
+        }
+        var r = PTPReader(data)
+        let count = Int(try r.u32())
+        // Each element is at least 9 bytes; guard against a garbage count.
+        guard count <= data.count / 9 else { throw .malformed("prop list count \(count)") }
+        var partials: [UInt32: Partial] = [:]
+        for _ in 0..<count {
+            let handle = try r.u32()
+            let property = try r.u16()
+            let type = try r.u16()
+            var partial = partials[handle] ?? Partial()
+            switch (property, type) {
+            case (ObjectProperty.storageID, 0x0006): partial.storageID = try r.u32()
+            case (ObjectProperty.format, 0x0004): partial.format = try r.u16()
+            case (ObjectProperty.size, 0x0008): partial.size = try r.u64()
+            case (ObjectProperty.parent, 0x0006): partial.parent = try r.u32()
+            case (ObjectProperty.filename, 0xFFFF): partial.filename = try r.string()
+            case (ObjectProperty.modified, 0xFFFF): partial.modified = parseDate(try r.string())
+            default: try r.skipValue(ofType: type)
+            }
+            partials[handle] = partial
+        }
+        return partials.compactMapValues { p in
+            guard let filename = p.filename, let format = p.format else { return nil }
+            return ObjectInfo(
+                storageID: p.storageID, format: format, size: UInt32(clamping: p.size),
+                parent: p.parent, filename: filename, modified: p.modified)
+        }
+    }
+
     // MARK: - Strings & dates
 
     /// PTP string: `u8` count of UTF-16 code units *including* the NUL
@@ -230,6 +284,27 @@ nonisolated struct PTPReader {
     mutating func u32() throws(MTPError) -> UInt32 {
         let lo = UInt32(try u16())
         return lo | UInt32(try u16()) << 16
+    }
+
+    mutating func u64() throws(MTPError) -> UInt64 {
+        let lo = UInt64(try u32())
+        return lo | UInt64(try u32()) << 32
+    }
+
+    /// Skips a value of an MTP datatype: integers 0x0001–0x000A (8 to 128
+    /// bits, signed/unsigned pairs), their array forms (0x4000 bit: `u32`
+    /// count then elements), or a string (0xFFFF).
+    mutating func skipValue(ofType type: UInt16) throws(MTPError) {
+        if type == 0xFFFF {
+            _ = try string()
+            return
+        }
+        let scalar = type & ~0x4000
+        guard (1...10).contains(scalar) else { throw .malformed("datatype \(type)") }
+        let size = 1 << ((Int(scalar) - 1) / 2)
+        let count = type & 0x4000 != 0 ? Int(try u32()) : 1
+        guard count <= data.count else { throw .malformed("array count \(count)") }
+        _ = try bytes(size * count)
     }
 
     mutating func string() throws(MTPError) -> String {

@@ -22,12 +22,16 @@ nonisolated protocol BookDevice: Sendable {
 
     /// Filenames currently on the device, in whatever destination folder
     /// the device uses. Used to detect "already on device".
-    func filenames() -> Set<String>
+    ///
+    /// Like `files()`, async so an MTP device can wait its turn for the
+    /// USB interface without holding a thread. Volume drivers do blocking
+    /// disk I/O in both, so call them off the main actor.
+    func filenames() async -> Set<String>
 
     /// Full file listing with size + modification date — for the device
     /// contents management surface. Heavier than `filenames()`; not used
     /// on the grid hot path.
-    func files() -> [DeviceFile]
+    func files() async -> [DeviceFile]
 
     /// What this book's filename will be on the device after sanitisation.
     /// Kept consistent across copy/remove/match.

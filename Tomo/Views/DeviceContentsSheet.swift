@@ -337,7 +337,7 @@ struct DeviceContentsSheet: View {
 
     private func refresh() async {
         loading = true
-        let files = await Task.detached { device.files() }.value
+        let files = await Task.detached { await device.files() }.value
         // `uniquingKeysWith` guards against the theoretical case where two
         // library books compute the same on-device filename. `bookFileSlug`
         // is unique by design today, so the merge function never fires;

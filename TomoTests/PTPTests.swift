@@ -96,6 +96,54 @@ struct PTPTests {
         #expect(PTP.parseDate("garbage-date-str") == nil)
     }
 
+    @Test func decodesObjectPropList() throws {
+        var data = Data()
+        func element(_ handle: UInt32, _ property: UInt16, _ type: UInt16, _ value: Data) {
+            data.appendLE(handle)
+            data.appendLE(property)
+            data.appendLE(type)
+            data.append(value)
+        }
+        func le<T: FixedWidthInteger>(_ v: T) -> Data {
+            var d = Data()
+            d.appendLE(v)
+            return d
+        }
+        data.appendLE(UInt32(9))
+        element(7, 0xDC02, 0x0004, le(UInt16(0x3000)))
+        element(7, 0xDC04, 0x0008, le(UInt64(1234)))
+        element(7, 0xDC07, 0xFFFF, PTP.encodeString("book.azw3"))
+        element(7, 0xDC09, 0xFFFF, PTP.encodeString("20261114T143005Z"))
+        element(7, 0xDC41, 0x000A, Data(count: 16))  // persistent UID: skipped
+        element(7, 0xDC99, 0x4004, le(UInt32(2)) + le(UInt16(1)) + le(UInt16(2)))  // array: skipped
+        element(8, 0xDC02, 0x0004, le(UInt16(0x3001)))
+        element(8, 0xDC07, 0xFFFF, PTP.encodeString("Sci-Fi"))
+        element(9, 0xDC04, 0x0008, le(UInt64(5)))  // no filename: left out
+
+        let infos = try PTP.decodeObjectPropList(data)
+        #expect(infos.count == 2)
+        #expect(infos[7]?.filename == "book.azw3")
+        #expect(infos[7]?.size == 1234)
+        #expect(infos[7]?.isFolder == false)
+        #expect(infos[7]?.modified?.timeIntervalSince1970 == 1_794_666_605)
+        #expect(infos[8]?.filename == "Sci-Fi")
+        #expect(infos[8]?.isFolder == true)
+    }
+
+    @Test func objectPropListRejectsGarbage() {
+        var overlong = Data()
+        overlong.appendLE(UInt32(1000))
+        #expect(throws: MTPError.self) { try PTP.decodeObjectPropList(overlong) }
+
+        var unknownType = Data()
+        unknownType.appendLE(UInt32(1))
+        unknownType.appendLE(UInt32(7))
+        unknownType.appendLE(UInt16(0xDC99))
+        unknownType.appendLE(UInt16(0x1234))
+        unknownType.append(Data(count: 8))
+        #expect(throws: MTPError.self) { try PTP.decodeObjectPropList(unknownType) }
+    }
+
     @Test func cancelRequestCarriesEventCodeAndTransaction() {
         let bytes = [UInt8](PTP.cancelRequestData(transactionID: 0x0102_0304))
         #expect(bytes == [0x01, 0x40, 0x04, 0x03, 0x02, 0x01])

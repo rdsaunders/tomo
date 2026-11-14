@@ -40,11 +40,13 @@ nonisolated struct Kobo: BookDevice {
         ["epub", "pdf"]
     }
 
-    func filenames() -> Set<String> {
-        Set(files().map(\.name))
+    func filenames() async -> Set<String> {
+        Set(listFiles().map(\.name))
     }
 
-    func files() -> [DeviceFile] {
+    func files() async -> [DeviceFile] { listFiles() }
+
+    private func listFiles() -> [DeviceFile] {
         let root = volumeURL
         let rootPath = root.path(percentEncoded: false)
         let keys: [URLResourceKey] = [

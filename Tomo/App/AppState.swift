@@ -458,7 +458,7 @@ final class AppState {
         let detected = await Task.detached { DeviceScanner.detect() }.value
         self.device = detected
         if let detected {
-            self.deviceFilenames = await Task.detached { detected.filenames() }.value
+            self.deviceFilenames = await Task.detached { await detected.filenames() }.value
         } else {
             self.deviceFilenames = []
         }
@@ -803,7 +803,7 @@ final class AppState {
                 deliveryLogger.error("device copy failed: \(error.localizedDescription, privacy: .public)")
             }
         }
-        deviceFilenames = await Task.detached { device.filenames() }.value
+        deviceFilenames = await Task.detached { await device.filenames() }.value
         if didMigrate { await loadBooks() }
 
         if let lastError, successes == 0 {
@@ -834,7 +834,7 @@ final class AppState {
             try await device.remove(book)
             deliveryLogger.info(
                 "removed from \(device.displayName, privacy: .public): \(book.title, privacy: .public)")
-            deviceFilenames = await Task.detached { device.filenames() }.value
+            deviceFilenames = await Task.detached { await device.filenames() }.value
         } catch {
             deliveryLogger.error("device remove failed: \(error.localizedDescription, privacy: .public)")
         }
@@ -859,7 +859,7 @@ final class AppState {
                 )
             }
         }
-        deviceFilenames = await Task.detached { device.filenames() }.value
+        deviceFilenames = await Task.detached { await device.filenames() }.value
     }
 
     func ejectDevice() async {
@@ -921,7 +921,7 @@ final class AppState {
         if skipIfUnchanged, detected?.id == device?.id { return }
         device = detected
         if let detected {
-            deviceFilenames = await Task.detached { detected.filenames() }.value
+            deviceFilenames = await Task.detached { await detected.filenames() }.value
         } else {
             deviceFilenames = []
         }

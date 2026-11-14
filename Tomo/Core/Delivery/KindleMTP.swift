@@ -24,18 +24,18 @@ nonisolated struct KindleMTP: BookDevice {
         MTPConnection.connectedKindles().first.map { KindleMTP(serial: $0.serial) }
     }
 
-    func filenames() -> Set<String> {
-        Set(files().map(\.name))
+    func filenames() async -> Set<String> {
+        Set(await files().map(\.name))
     }
 
     /// Retries once: the first listing after USB attach can land before the
     /// Kindle is ready for sessions, and an empty result would show every
     /// book as "not on device" (inviting duplicate re-sends) until the next
     /// refresh.
-    func files() -> [DeviceFile] {
+    func files() async -> [DeviceFile] {
         for attempt in 1...2 {
             do {
-                return try MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
+                return try await MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
                     try listDocuments(conn)
                 }
             } catch {
@@ -44,7 +44,7 @@ nonisolated struct KindleMTP: BookDevice {
                 deliveryLogger.error(
                     "kindle mtp listing failed (attempt \(attempt)): \(error.localizedDescription, privacy: .public)")
                 if case .deviceNotFound = error { break }
-                if attempt == 1 { Thread.sleep(forTimeInterval: 1) }
+                if attempt == 1 { try? await Task.sleep(for: .seconds(1)) }
             }
         }
         return []
@@ -54,42 +54,61 @@ nonisolated struct KindleMTP: BookDevice {
         KindleDelivery.isSystemFile(relativePath: relativePath)
     }
 
+    /// The book and its home-screen thumbnail go in one session, so the
+    /// device's folders are only looked up once per send.
     func copy(_ book: Book) async throws {
         let name = deviceFilename(for: book)
         let serial = serial
-        let convertedFromEPUB = try await KindleDelivery.withDeliverableFile(
-            for: book, route: deliveryRoute(for: book)
-        ) { file in
-            try await Task.detached {
-                do {
-                    try MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
-                        let (storage, documents) = try Self.documentsFolder(conn)
-                        try conn.upload(file, as: name, storage: storage, parent: documents)
+        let route = deliveryRoute(for: book)
+        // Same condition `withDeliverableFile` reports back: an EPUB that
+        // gets converted needs the thumbnail written alongside it.
+        var convertsEPUB = false
+        if case .convert = route { convertsEPUB = book.fileURL.pathExtension.lowercased() == "epub" }
+        let thumbnail =
+            convertsEPUB
+            ? await Self.coverThumbnail(epubURL: book.fileURL, coverOverride: book.coverURL) : nil
+
+        _ = try await KindleDelivery.withDeliverableFile(for: book, route: route) { file in
+            do {
+                try await MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
+                    let (storage, documents) = try Self.documentsFolder(conn)
+                    try conn.upload(file, as: name, storage: storage, parent: documents)
+                    guard let thumbnail else { return }
+                    // Best-effort, like the volume driver: the book is usable
+                    // without it. No `.tomo/cover-thumbnails` mirror and no
+                    // restore-on-reconnect yet (`KindleSync` is volume-only),
+                    // so a cover Amazon overwrites while the Kindle is online
+                    // stays overwritten until the book is re-sent.
+                    do throws(MTPError) {
+                        // Created if missing, like the volume driver does.
+                        let thumbnails = try conn.folder(
+                            at: KindleCoverThumbnail.thumbnailsSubpath, storage: storage, create: true)
+                        try conn.upload(
+                            thumbnail.bytes, as: thumbnail.filename, storage: storage, parent: thumbnails)
+                        deliveryLogger.info(
+                            "kindle mtp thumbnail wrote \(thumbnail.bytes.count) bytes to \(thumbnail.filename, privacy: .public)")
+                    } catch {
+                        deliveryLogger.warning(
+                            "kindle mtp thumbnail write failed: \(error.localizedDescription, privacy: .public)")
                     }
-                } catch {
-                    throw BookDeviceError.copyFailed(underlying: error)
                 }
-            }.value
-        }
-        if convertedFromEPUB {
-            await writeCoverThumbnail(epubURL: book.fileURL, coverOverride: book.coverURL)
+            } catch {
+                throw BookDeviceError.copyFailed(underlying: error)
+            }
         }
     }
 
     func removeFile(at relativePath: String) async throws {
-        let serial = serial
         do {
-            try await Task.detached {
-                try MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
-                    let (storage, documents) = try Self.documentsFolder(conn)
-                    let folderPath = (relativePath as NSString).deletingLastPathComponent
-                    let name = (relativePath as NSString).lastPathComponent
-                    let parent = try conn.folder(at: folderPath, storage: storage, from: documents)
-                    guard let file = try conn.child(named: name, storage: storage, parent: parent)
-                    else { throw .notFound(relativePath) }
-                    try conn.delete(file.handle)
-                }
-            }.value
+            try await MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
+                let (storage, documents) = try Self.documentsFolder(conn)
+                let folderPath = (relativePath as NSString).deletingLastPathComponent
+                let name = (relativePath as NSString).lastPathComponent
+                let parent = try conn.folder(at: folderPath, storage: storage, from: documents)
+                guard let file = try conn.child(named: name, storage: storage, parent: parent)
+                else { throw .notFound(relativePath) }
+                try conn.delete(file.handle)
+            }
         } catch {
             throw BookDeviceError.removeFailed(underlying: error)
         }
@@ -99,9 +118,8 @@ nonisolated struct KindleMTP: BookDevice {
     /// leaves its "connected to computer" screen, the MTP interface goes
     /// away, and it isn't detected again until it's replugged.
     func eject() async throws {
-        let serial = serial
         do {
-            try await Task.detached { try MTPConnection.unconfigure(serial: serial) }.value
+            try await MTPConnection.unconfigure(serial: serial)
         } catch {
             throw BookDeviceError.ejectFailed(underlying: error)
         }
@@ -157,31 +175,22 @@ nonisolated struct KindleMTP: BookDevice {
         return results
     }
 
-    /// Best-effort, like the volume driver: the book is usable without it.
-    /// No `.tomo/cover-thumbnails` mirror and no restore-on-reconnect yet
-    /// (`KindleSync` is volume-only), so a cover Amazon overwrites while the
-    /// Kindle is online stays overwritten until the book is re-sent.
-    private func writeCoverThumbnail(epubURL: URL, coverOverride: URL?) async {
-        let serial = serial
-        do {
-            try await Task.detached {
+    /// The home-screen thumbnail for an EPUB, read off the main actor
+    /// (it parses the EPUB and resizes the cover). Nil when there's no
+    /// cover or it can't be read.
+    private static func coverThumbnail(epubURL: URL, coverOverride: URL?) async -> (
+        filename: String, bytes: Data
+    )? {
+        await Task.detached {
+            do {
                 let manifest = try EPUBSource.read(
                     from: epubURL, coverSource: .override(coverOverride))
-                guard let (filename, bytes) = KindleCoverThumbnail.thumbnail(for: manifest)
-                else { return }
-                try MTPConnection.withSession(serial: serial) { conn throws(MTPError) in
-                    let (storage, _) = try Self.documentsFolder(conn)
-                    // Created if missing, like the volume driver does.
-                    let thumbnails = try conn.folder(
-                        at: KindleCoverThumbnail.thumbnailsSubpath, storage: storage, create: true)
-                    try conn.upload(bytes, as: filename, storage: storage, parent: thumbnails)
-                }
-                deliveryLogger.info(
-                    "kindle mtp thumbnail wrote \(bytes.count) bytes to \(filename, privacy: .public)")
-            }.value
-        } catch {
-            deliveryLogger.warning(
-                "kindle mtp thumbnail write failed: \(error.localizedDescription, privacy: .public)")
-        }
+                return KindleCoverThumbnail.thumbnail(for: manifest)
+            } catch {
+                deliveryLogger.warning(
+                    "kindle mtp thumbnail skipped: \(error.localizedDescription, privacy: .public)")
+                return nil
+            }
+        }.value
     }
 }

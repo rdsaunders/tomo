@@ -33,14 +33,16 @@ nonisolated struct Kindle: BookDevice {
 
     var supportedFormats: Set<String> { KindleDelivery.supportedFormats }
 
-    func filenames() -> Set<String> {
+    func filenames() async -> Set<String> {
         // Basenames only (no path), so the grid's "is this book on device?"
         // check works whether the book sits at the top level or inside an
         // on-device collection folder. Same recursion + filter as `files()`.
-        Set(files().map(\.name))
+        Set(listFiles().map(\.name))
     }
 
-    func files() -> [DeviceFile] {
+    func files() async -> [DeviceFile] { listFiles() }
+
+    private func listFiles() -> [DeviceFile] {
         let documents = volumeURL.appending(component: "documents")
         let documentsPath = documents.path(percentEncoded: false)
         let keys: [URLResourceKey] = [

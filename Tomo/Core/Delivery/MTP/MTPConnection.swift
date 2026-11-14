@@ -2,7 +2,6 @@ import Foundation
 import IOKit
 import IOUSBHost
 import os
-import Synchronization
 
 /// Errors at the MTP boundary. Surfaced to the user through
 /// `BookDeviceError`, so messages say what to do, not what broke.
@@ -48,24 +47,24 @@ nonisolated struct MTPDeviceDescriptor: Sendable, Equatable {
 /// Usage is always `MTPConnection.withSession(serial:) { conn in … }`: open,
 /// do the work, close. Sessions are short-lived on purpose — no lifecycle to
 /// manage across plug/unplug, and nothing is held open when the user pulls
-/// the cable. A process-wide lock serialises sessions because the USB
-/// interface is exclusive.
-///
-/// All calls block; run them off the main actor.
+/// the cable. Sessions run one at a time on a dedicated thread
+/// (`MTPSessionQueue`) because the USB interface is exclusive and its I/O
+/// blocks; `withSession` is the async way in.
 nonisolated final class MTPConnection {
     static let amazonVendorID = 0x1949
 
-    /// Process-wide state carried between sessions, guarded by the lock that
+    /// Process-wide state carried between sessions, owned by the queue that
     /// serialises them.
-    private struct SessionState {
+    fileprivate struct SessionState {
         /// IORegistry entry ID of the USB interface whose last session ended
         /// mid-transaction; recover before the next OpenSession on it so it
         /// doesn't read a stale reply. A replugged Kindle gets a new entry
         /// and starts clean, so it's skipped.
         var needsRecovery: UInt64?
+        /// Serials whose firmware refused or garbled GetObjectPropList, so
+        /// listings go one GetObjectInfo per object.
+        var propListUnsupported: Set<String> = []
     }
-
-    private static let sessionLock = Mutex(SessionState())
 
     private let service: io_service_t
     private let interface: IOUSBHostInterface
@@ -77,6 +76,9 @@ nonisolated final class MTPConnection {
     /// back. Non-nil after a throw means the device and host disagree about
     /// where the conversation is — no further commands until `recover()`.
     private var inFlight: UInt32?
+    /// Whether `children` may fetch a whole folder's metadata in one
+    /// GetObjectPropList round trip.
+    private var canUsePropList = true
     /// An I/O error said the device is gone (unplugged). Recovery is
     /// pointless then — there's nothing to talk to.
     private var sawDeviceGone = false
@@ -117,45 +119,56 @@ nonisolated final class MTPConnection {
     /// transaction the session isn't closed (the device would read the
     /// CloseSession as payload); it's recovered instead, now and again before
     /// the next session.
-    static func withSession<T>(
-        serial: String, _ body: (MTPConnection) throws(MTPError) -> T
+    ///
+    /// Sessions run one at a time on `MTPSessionQueue`'s own thread: callers
+    /// suspend while they wait their turn and while the USB I/O blocks, so a
+    /// minutes-long upload never ties up Swift's cooperative pool.
+    static func withSession<T: Sendable>(
+        serial: String, _ body: @Sendable (MTPConnection) throws(MTPError) -> T
+    ) async throws(MTPError) -> T {
+        try await MTPSessionQueue.shared.withSession(serial: serial, body)
+    }
+
+    fileprivate static func runSession<T>(
+        serial: String, state: inout SessionState,
+        _ body: (MTPConnection) throws(MTPError) -> T
     ) throws(MTPError) -> T {
-        try sessionLock.withLock { state throws(MTPError) in
-            var found: io_service_t = 0
-            forEachMTPInterface { service in
-                guard parentProperty(service, "kUSBSerialNumberString") as? String == serial
-                else { return false }
-                IOObjectRetain(service)
-                found = service
-                return true
+        var found: io_service_t = 0
+        forEachMTPInterface { service in
+            guard parentProperty(service, "kUSBSerialNumberString") as? String == serial
+            else { return false }
+            IOObjectRetain(service)
+            found = service
+            return true
+        }
+        guard found != 0 else { throw .deviceNotFound }
+        defer { IOObjectRelease(found) }
+
+        var entryID: UInt64 = 0
+        IORegistryEntryGetRegistryEntryID(found, &entryID)
+
+        let connection = try MTPConnection(service: found)
+        defer { connection.interface.destroy() }
+        if state.needsRecovery == entryID { connection.recover() }
+        state.needsRecovery = nil
+        connection.canUsePropList = !state.propListUnsupported.contains(serial)
+        defer { if !connection.canUsePropList { state.propListUnsupported.insert(serial) } }
+
+        do throws(MTPError) {
+            try connection.openSession()
+            let result = try body(connection)
+            if !connection.endSession() { state.needsRecovery = entryID }
+            return result
+        } catch {
+            if !connection.endSession() { state.needsRecovery = entryID }
+            // Say "disconnected", not "USB transfer failed", when the
+            // cable was pulled.
+            if case .transport(let detail) = error, connection.isDeviceGone {
+                deliveryLogger.notice(
+                    "mtp transfer cut off by disconnect: \(detail, privacy: .public)")
+                throw .deviceNotFound
             }
-            guard found != 0 else { throw .deviceNotFound }
-            defer { IOObjectRelease(found) }
-
-            var entryID: UInt64 = 0
-            IORegistryEntryGetRegistryEntryID(found, &entryID)
-
-            let connection = try MTPConnection(service: found)
-            defer { connection.interface.destroy() }
-            if state.needsRecovery == entryID { connection.recover() }
-            state.needsRecovery = nil
-
-            do throws(MTPError) {
-                try connection.openSession()
-                let result = try body(connection)
-                if !connection.endSession() { state.needsRecovery = entryID }
-                return result
-            } catch {
-                if !connection.endSession() { state.needsRecovery = entryID }
-                // Say "disconnected", not "USB transfer failed", when the
-                // cable was pulled.
-                if case .transport(let detail) = error, connection.isDeviceGone {
-                    deliveryLogger.notice(
-                        "mtp transfer cut off by disconnect: \(detail, privacy: .public)")
-                    throw .deviceNotFound
-                }
-                throw error
-            }
+            throw error
         }
     }
 
@@ -163,25 +176,27 @@ nonisolated final class MTPConnection {
     /// device. The Kindle treats that as the host letting go — it leaves the
     /// "connected to computer" screen and stays usable on the cable — and
     /// macOS doesn't reconfigure it until it's unplugged and replugged.
-    /// Takes the session lock so it can't cut an in-flight transfer short.
-    static func unconfigure(serial: String) throws(MTPError) {
-        try sessionLock.withLock { _ throws(MTPError) in
-            let matching = IOServiceMatching("IOUSBHostDevice") as NSMutableDictionary
-            matching[kIOPropertyMatchKey] = [
-                "idVendor": amazonVendorID, "kUSBSerialNumberString": serial,
-            ]
-            let service = IOServiceGetMatchingService(kIOMainPortDefault, matching)
-            guard service != 0 else { throw .deviceNotFound }
-            defer { IOObjectRelease(service) }
-            do {
-                let device = try IOUSBHostDevice(
-                    __ioService: service, options: [], queue: nil, interestHandler: nil)
-                defer { device.destroy() }
-                try device.__configure(withValue: 0, matchInterfaces: false)
-            } catch {
-                if (error as NSError).code == Int(Int32(bitPattern: 0xE000_02C5)) { throw .deviceBusy }
-                throw .transport(describe(error))
-            }
+    /// Queued behind sessions so it can't cut an in-flight transfer short.
+    static func unconfigure(serial: String) async throws(MTPError) {
+        try await MTPSessionQueue.shared.unconfigure(serial: serial)
+    }
+
+    fileprivate static func unconfigureNow(serial: String) throws(MTPError) {
+        let matching = IOServiceMatching("IOUSBHostDevice") as NSMutableDictionary
+        matching[kIOPropertyMatchKey] = [
+            "idVendor": amazonVendorID, "kUSBSerialNumberString": serial,
+        ]
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, matching)
+        guard service != 0 else { throw .deviceNotFound }
+        defer { IOObjectRelease(service) }
+        do {
+            let device = try IOUSBHostDevice(
+                __ioService: service, options: [], queue: nil, interestHandler: nil)
+            defer { device.destroy() }
+            try device.__configure(withValue: 0, matchInterfaces: false)
+        } catch {
+            if (error as NSError).code == Int(Int32(bitPattern: 0xE000_02C5)) { throw .deviceBusy }
+            throw .transport(describe(error))
         }
     }
 
@@ -583,11 +598,49 @@ nonisolated final class MTPConnection {
         let info: PTP.ObjectInfo
     }
 
+    /// The objects directly inside `parent`. GetObjectHandles says which
+    /// they are; their metadata comes from one GetObjectPropList for the
+    /// whole folder where the device allows it, otherwise (and for any
+    /// object that reply leaves out) from a GetObjectInfo each — a send to
+    /// a Kindle holding 500 books is then 2 round trips, not 501.
     func children(storage: UInt32, parent: UInt32) throws(MTPError) -> [Object] {
         let handles = try PTP.parseUInt32Array(
             transact(.getObjectHandles, [storage, 0, parent]).data)
+        // The root is small, and devices disagree on how to name it here.
+        let known =
+            canUsePropList && parent != PTP.rootParent && handles.count > 1
+            ? try bulkInfo(inside: parent, expecting: handles) : [:]
         return try handles.map { handle throws(MTPError) in
-            Object(handle: handle, info: try PTP.decodeObjectInfo(transact(.getObjectInfo, [handle]).data))
+            if let info = known[handle] { return Object(handle: handle, info: info) }
+            return Object(
+                handle: handle,
+                info: try PTP.decodeObjectInfo(transact(.getObjectInfo, [handle]).data))
+        }
+    }
+
+    /// All properties of everything one level below `parent`, keyed by
+    /// handle. Any failure turns the fast path off for this device for the
+    /// rest of the run; it only throws if the session is left out of step.
+    private func bulkInfo(inside parent: UInt32, expecting handles: [UInt32])
+        throws(MTPError) -> [UInt32: PTP.ObjectInfo]
+    {
+        do throws(MTPError) {
+            // Params: object, format (any), property (all), group, depth.
+            let data = try transact(.getObjectPropList, [parent, 0, 0xFFFF_FFFF, 0, 1]).data
+            let infos = try PTP.decodeObjectPropList(data)
+            let covered = handles.count { infos[$0] != nil }
+            deliveryLogger.debug("mtp bulk listing covered \(covered) of \(handles.count) objects")
+            if covered == 0 {
+                deliveryLogger.notice("mtp bulk listing covered none of the folder; using per-object listing")
+                canUsePropList = false
+            }
+            return infos
+        } catch {
+            canUsePropList = false
+            deliveryLogger.notice(
+                "mtp bulk listing unavailable (\(error.localizedDescription, privacy: .public)); using per-object listing")
+            guard inFlight == nil else { throw error }
+            return [:]
         }
     }
 
@@ -724,5 +777,27 @@ extension Data {
     /// length field before the rest arrives.
     fileprivate nonisolated func padded(to length: Int) -> Data {
         count >= length ? self : self + Data(count: length - count)
+    }
+}
+
+/// Runs every MTP session, one at a time, on its own dispatch queue instead
+/// of Swift's cooperative pool: the USB calls block (an upload for minutes),
+/// and callers queued behind one should suspend, not hold a pool thread.
+private actor MTPSessionQueue {
+    static let shared = MTPSessionQueue()
+
+    private let queue = DispatchSerialQueue(label: "com.pdrbrnd.tomo.mtp")
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
+    private var state = MTPConnection.SessionState()
+
+    func withSession<T: Sendable>(
+        serial: String, _ body: @Sendable (MTPConnection) throws(MTPError) -> T
+    ) throws(MTPError) -> T {
+        try MTPConnection.runSession(serial: serial, state: &state, body)
+    }
+
+    func unconfigure(serial: String) throws(MTPError) {
+        try MTPConnection.unconfigureNow(serial: serial)
     }
 }

@@ -19,9 +19,9 @@
             self.mockFilenames = mockFilenames
         }
 
-        func filenames() -> Set<String> { mockFilenames }
+        func filenames() async -> Set<String> { mockFilenames }
 
-        func files() -> [DeviceFile] {
+        func files() async -> [DeviceFile] {
             mockFilenames.map { name in
                 DeviceFile(relativePath: name, size: 524_288, modifiedAt: .now)
             }
