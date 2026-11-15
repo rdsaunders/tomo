@@ -717,8 +717,8 @@ nonisolated final class MTPConnection {
     ///
     /// That means a re-send that fails part-way loses the old copy. Staging
     /// the new copy and swapping it in afterwards would avoid that, but the
-    /// Paperwhite 12th gen refuses both ways of doing it, although its
-    /// DeviceInfo lists both operations:
+    /// Kindle 11th gen (2024 release, FW 5.20.2.0.1) refuses both ways of
+    /// doing it, although its DeviceInfo lists both operations:
     /// - SetObjectPropValue(ObjectFileName), renaming a temporary object:
     ///   0x201C (Invalid DeviceProp Value), even for fresh names after a
     ///   restart
