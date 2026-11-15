@@ -1,9 +1,9 @@
 import Foundation
 import os
 
-/// MTP Kindle driver — Kindles from 2024 on (Paperwhite 12th gen, Colorsoft,
-/// Kindle 11th gen refresh, Scribe) connect over MTP only and never mount a
-/// volume. Same delivery behaviour as the volume `Kindle` driver (formats,
+/// MTP Kindle driver — for Kindles that connect over MTP only and never
+/// mount a volume. Tested on one model: the Kindle 11th generation (2024
+/// release), FW 5.20.2.0.1. Same delivery behaviour as the volume `Kindle` driver (formats,
 /// EPUB→AZW3 conversion, system-file hiding, home-screen thumbnail) via
 /// `KindleDelivery`; only the transport differs.
 ///

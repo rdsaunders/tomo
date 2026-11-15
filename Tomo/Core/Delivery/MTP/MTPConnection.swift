@@ -40,9 +40,9 @@ nonisolated struct MTPDeviceDescriptor: Sendable, Equatable {
 }
 
 /// One MTP session over raw USB (`IOUSBHost`). Apple's ImageCaptureCore
-/// only claims class-6 "Still Image" interfaces; Kindles from 2024 on expose
-/// a vendor-specific (class 255) interface named "MTP", so we speak the
-/// protocol ourselves.
+/// only claims class-6 "Still Image" interfaces; the Kindle 11th generation
+/// (2024 release) exposes a vendor-specific (class 255) interface named
+/// "MTP", so we speak the protocol ourselves.
 ///
 /// Usage is always `MTPConnection.withSession(serial:) { conn in … }`: open,
 /// do the work, close. Sessions are short-lived on purpose — no lifecycle to
